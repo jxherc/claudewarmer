@@ -1,0 +1,8 @@
+﻿{
+    "taskName":  "ClaudeWindowWarmer",
+    "model":  "haiku",
+    "prompt":  "Reply with only: ok",
+    "baseUrl":  "https://api.anthropic.com",
+    "intervalHours":  5,
+    "intervalMinutes":  2
+}
