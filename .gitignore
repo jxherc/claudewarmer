@@ -2,5 +2,8 @@
 warm.log
 *.log
 
+# runtime scheduling state (bash/cron edition)
+warm.state
+
 # local only, never commit
 CLAUDE.md
