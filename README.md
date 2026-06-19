@@ -39,6 +39,8 @@ have no window to reset, so they're intentionally not included.
 
 ## Install
 
+### Windows (PowerShell + Task Scheduler)
+
 ```powershell
 # from the folder, once:
 & "$HOME\.claude-warmer\setup.ps1"
@@ -52,6 +54,39 @@ have no window to reset, so they're intentionally not included.
    for each (Claude is always on).
 
 Then open a **new** terminal and run `warmer status`.
+
+### Linux / macOS / WSL (bash + cron)
+
+Same tool, ported to bash. Needs `jq` (`apt install jq` / `brew install jq`) and `crontab`.
+
+```bash
+# from the folder, once:
+./setup.sh
+source ~/.bashrc   # or open a new shell
+warmer status
+```
+
+`setup.sh` adds a `warmer` shell function to your rc file, auto-detects installed
+CLIs and registers a cron entry for each (Claude always on). Same `config.json`,
+same subcommands as below — only the backend differs:
+
+- **Scheduling is cron, not Task Scheduler.** cron can't express an arbitrary
+  "every 5h2m" cadence, so each enabled provider gets one polling line
+  (`*/5 * * * *`) and the worker (`warm-window.sh -p <id> --due`) self-gates: it
+  only pings once the configured interval has elapsed since its last attempt
+  (tracked in `warm.state`). Worst case a ping fires up to 5 min late, which only
+  *widens* the gap between windows — it never fires early, so a window never
+  overlaps the previous one.
+- **The shared `config.json` ships Windows commands** (e.g. `%APPDATA%\npm\claude.cmd`).
+  The bash side translates those automatically — a windows-style path/extension is
+  reduced to the bare cli name (`claude.cmd` → `claude`) and resolved on `PATH`, so
+  `claude`/`glm` work out of the box. Override any provider with `warmer set <id> cmd <path>`.
+- **cron runs with a bare `PATH`**, so node/npm-installed clis would otherwise be
+  invisible to it. `setup`/`install` bake your current `PATH` into each cron line,
+  and the worker also widens `PATH` to the usual spots (homebrew, `~/.local/bin`,
+  nvm's current node, bun, deno). If you switch node versions, run `warmer restart`.
+- Files: `warmer.sh` (CLI), `warm-window.sh` (worker), `setup.sh` (bootstrap),
+  `warm.state` (cron gate, gitignored).
 
 ## The `warmer` command
 
