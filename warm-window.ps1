@@ -1,33 +1,60 @@
-# worker the ClaudeWindowWarmer task runs each cycle. one tiny ping -> a fresh 5h window starts.
+# worker the WindowWarmer tasks run each cycle. one tiny ping -> a fresh usage window starts.
+# takes a provider id (claude, codex, gemini, ...). defaults to claude so the old call still works.
+param([string]$Provider = 'claude')
+
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}   # so proxy/chinese errors don't turn into mojibake in the log
 Set-Location $PSScriptRoot
 $log = Join-Path $PSScriptRoot 'warm.log'
+$ts  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
-$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-
-$cfg = Get-Content (Join-Path $PSScriptRoot 'config.json') -Raw | ConvertFrom-Json
-$claude = Join-Path $env:APPDATA 'npm\claude.cmd'
-
-if (-not (Test-Path $claude)) {
-  "$ts  exit=127  claude.cmd not found at $claude" | Add-Content -Encoding utf8 $log
-  exit 127
+function logline($code, $msg) {
+  $msg = ($msg -replace '\s+', ' ').Trim()
+  if ($msg.Length -gt 220) { $msg = $msg.Substring(0, 220) }
+  "$ts  [$Provider]  exit=$code  $msg" | Add-Content -Encoding utf8 $log
 }
 
-# this box routes claude through a 3rd-party proxy by default (cc-switch -> cn.meai.cloud).
-# the 5h limit lives on the real subscription, so force the official endpoint + oauth login
-# and ditch whatever proxy key the scheduled task inherited from the user env.
-$env:ANTHROPIC_BASE_URL = $cfg.baseUrl
-Remove-Item Env:\ANTHROPIC_API_KEY    -ErrorAction SilentlyContinue
-Remove-Item Env:\ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
+$cfg = Get-Content (Join-Path $PSScriptRoot 'config.json') -Raw | ConvertFrom-Json
+$p   = $cfg.providers.$Provider
+if (-not $p) { logline 2 "unknown provider '$Provider'"; exit 2 }
 
-# $null piped in closes stdin right away so the cli doesn't sit there waiting 3s for it
-$resp = $null | & $claude -p $cfg.prompt --model $cfg.model --output-format text --strict-mcp-config 2>&1 | Out-String
+# resolve the command. if it looks like a path (has a slash / drive), expand %VARS% and check it exists.
+# otherwise trust it's on PATH and let the call fail loudly if it isn't.
+$cmd = $p.cmd
+if ($cmd -match '[\\/]') {
+  $cmd = [Environment]::ExpandEnvironmentVariables($cmd)
+  if (-not (Test-Path $cmd)) { logline 127 "command not found at $cmd"; exit 127 }
+}
+
+# build args: substitute {prompt} / {model}. if model is blank, drop {model} AND the flag right before it,
+# so a "-m {model}" / "--model {model}" pair vanishes clean instead of passing an empty value.
+$hasModel = -not [string]::IsNullOrWhiteSpace($p.model)
+$argList = @()
+foreach ($a in $p.args) {
+  if ($a -eq '{model}') {
+    if ($hasModel) { $argList += [string]$p.model }
+    else { if ($argList.Count -gt 0) { $argList = $argList[0..($argList.Count-2)] } }  # pop the trailing flag
+    continue
+  }
+  $argList += ($a -replace '\{prompt\}', $p.prompt) -replace '\{model\}', [string]$p.model
+}
+
+# some boxes route a cli through a 3rd-party proxy via the user env (e.g. claude -> cc-switch).
+# provider config can force the right endpoint and ditch inherited keys so the ping hits the real account.
+# (process exits right after, so no need to restore any of this)
+if ($p.env) {
+  foreach ($k in $p.env.PSObject.Properties.Name) { Set-Item -Path "Env:\$k" -Value $p.env.$k }
+}
+if ($p.clearEnv) {
+  foreach ($k in $p.clearEnv) { Remove-Item "Env:\$k" -ErrorAction SilentlyContinue }
+}
+
+# $null piped in closes stdin right away so the cli doesn't sit there waiting on it
+$resp = $null | & $cmd @argList 2>&1 | Out-String
 $code = $LASTEXITCODE
+if ($null -eq $code) { $code = 0 }   # some cmds don't set it on a clean run
 
-$resp = ($resp -replace '\s+', ' ').Trim()
-if ($resp.Length -gt 220) { $resp = $resp.Substring(0, 220) }
-"$ts  exit=$code  $resp" | Add-Content -Encoding utf8 $log
+logline $code $resp
 
 # don't let the log grow forever
 $lines = @(Get-Content $log -ErrorAction SilentlyContinue)

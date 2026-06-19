@@ -1,3 +1,6 @@
 # runtime log - local only
 warm.log
 *.log
+
+# local only, never commit
+CLAUDE.md

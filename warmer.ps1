@@ -1,5 +1,5 @@
-# warmer - cli for the claude 5h window warmer.
-# no param() block on purpose so subcommand args like bare numbers / words pass through clean as $args.
+# warmer - cli for the AI-cli window warmer. keeps each provider's rolling usage window fresh.
+# no param() block on purpose so subcommand args (bare ids/numbers/words) pass through clean as $args.
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
@@ -7,8 +7,7 @@ $Root    = $PSScriptRoot
 $CfgPath = Join-Path $Root 'config.json'
 $Log     = Join-Path $Root 'warm.log'
 $Worker  = Join-Path $Root 'warm-window.ps1'
-$Claude  = Join-Path $env:APPDATA 'npm\claude.cmd'
-$Version = '1.0.0'
+$Version = '2.0.0'
 
 # ---------- helpers ----------
 function ok($m)   { Write-Host $m -ForegroundColor Green }
@@ -18,8 +17,42 @@ function dim($m)  { Write-Host $m -ForegroundColor DarkGray }
 function head($m) { Write-Host ""; Write-Host $m -ForegroundColor Cyan }
 
 function Cfg      { Get-Content $CfgPath -Raw | ConvertFrom-Json }
-function SaveCfg($c) { ($c | ConvertTo-Json) | Set-Content -Encoding utf8 $CfgPath }
-function TaskOf   { Get-ScheduledTask -TaskName (Cfg).taskName -ErrorAction SilentlyContinue }
+function SaveCfg($c) { ($c | ConvertTo-Json -Depth 10) | Set-Content -Encoding utf8 $CfgPath }
+
+function ProvIds  { @((Cfg).providers.PSObject.Properties.Name) }
+function Prov($id) { (Cfg).providers.$id }
+function EnabledIds { @((Cfg).providers.PSObject.Properties | Where-Object { $_.Value.enabled } | ForEach-Object { $_.Name }) }
+function TaskName($id) { "$((Cfg).taskPrefix)-$id" }
+function TaskOf($id)   { Get-ScheduledTask -TaskName (TaskName $id) -ErrorAction SilentlyContinue }
+
+function ValidateProvider($id) {
+  if (-not ((ProvIds) -contains $id)) { throw "unknown provider '$id'. known: $((ProvIds) -join ', ')" }
+}
+
+# is the provider's cli actually installed? path-like -> Test-Path, bare name -> look on PATH
+function Detect($id) {
+  $cmd = (Prov $id).cmd
+  if ($cmd -match '[\\/]') { return (Test-Path ([Environment]::ExpandEnvironmentVariables($cmd))) }
+  [bool](Get-Command $cmd -ErrorAction SilentlyContinue)
+}
+
+# turn a rest-arg into a set of provider ids.
+#   mode 'enabled' : no arg -> all enabled,  'all' -> every provider,  id -> [id]
+#   mode 'all'     : no arg -> every provider,                         id -> [id]
+#   mode 'require' : no arg -> error (must name one or 'all')
+function ResolveIds($rest, $mode) {
+  $arg = $rest[0]
+  if (-not $arg) {
+    switch ($mode) {
+      'enabled' { return @(EnabledIds) }
+      'all'     { return @(ProvIds) }
+      'require' { throw "which provider? give an id or 'all'   (see: warmer list)" }
+    }
+  }
+  if ($arg -eq 'all') { return @(ProvIds) }
+  ValidateProvider $arg
+  @($arg)
+}
 
 function HumanSpan($ts) {
   if ($ts -eq $null) { return 'n/a' }
@@ -33,7 +66,7 @@ function HumanSpan($ts) {
   if ($neg) { "$s ago" } else { "in $s" }
 }
 
-# turns "5h2m", "5:02", "302" (mins) or "5 2" into @{H;M}
+# "5h2m", "5:02", "302" (mins) or "5 2" -> @{H;M}
 function ParseInterval($parts) {
   $txt = ($parts -join ' ').Trim()
   if ($txt -match '^(\d+)\s*[hH]\s*(\d+)\s*[mM]?$')      { return @{ H=[int]$Matches[1]; M=[int]$Matches[2] } }
@@ -44,12 +77,20 @@ function ParseInterval($parts) {
   throw "can't parse interval '$txt'. try: 5h2m  |  5:02  |  302  (minutes)"
 }
 
-function RegisterTask {
-  $c = Cfg
-  $name = $c.taskName
-  $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Worker`""
+function Remove-LegacyTask {
+  if (Get-ScheduledTask -TaskName 'ClaudeWindowWarmer' -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName 'ClaudeWindowWarmer' -Confirm:$false -ErrorAction SilentlyContinue
+    dim "  removed legacy task ClaudeWindowWarmer"
+  }
+}
+
+function RegisterTask($id) {
+  $p = Prov $id
+  if ($p.intervalHours -eq 0 -and $p.intervalMinutes -eq 0) { throw "[$id] interval is zero - set one first" }
+  $name = TaskName $id
+  $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Worker`" -Provider $id"
   $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-               -RepetitionInterval (New-TimeSpan -Hours $c.intervalHours -Minutes $c.intervalMinutes) `
+               -RepetitionInterval (New-TimeSpan -Hours $p.intervalHours -Minutes $p.intervalMinutes) `
                -RepetitionDuration (New-TimeSpan -Days 3650)   # MaxValue overflows the task xml, 10y is plenty
   $settings = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable `
                -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -65,28 +106,35 @@ function RegisterTask {
   powercfg /SETACTIVE SCHEME_CURRENT 2>$null | Out-Null
 }
 
-function LogLines { @(Get-Content $Log -ErrorAction SilentlyContinue) | Where-Object { $_ -match 'exit=' } }
+# log lines (only real ping lines). pass an id to filter to one provider.
+function LogLines($id) {
+  $all = @(Get-Content $Log -ErrorAction SilentlyContinue) | Where-Object { $_ -match 'exit=' }
+  if ($id) { $all = $all | Where-Object { $_ -match "\[$id\]" } }
+  @($all)
+}
 
-function WaitForPing($beforeCount, $timeoutSec) {
+function WaitForPing($id, $beforeCount, $timeoutSec) {
   $deadline = (Get-Date).AddSeconds($timeoutSec)
   do {
     Start-Sleep -Seconds 4
-    $now = (@(LogLines)).Count
-    $t = TaskOf
-    $running = $t -and ((Get-ScheduledTask -TaskName $t.TaskName | Get-ScheduledTaskInfo).LastTaskResult -eq 0x41301)
+    $now = (LogLines $id).Count
+    $t = TaskOf $id
+    $running = $t -and (($t | Get-ScheduledTaskInfo).LastTaskResult -eq 0x41301)
   } until (($now -gt $beforeCount -and -not $running) -or (Get-Date) -gt $deadline)
 }
 
 # ---------- subcommands ----------
-function Cmd-Status {
-  $c = Cfg
-  $t = TaskOf
-  head "Claude Window Warmer"
-  if (-not $t) { bad "  task NOT installed   ->  run: warmer install"; return }
+function Show-Detail($id) {
+  $p = Prov $id
+  $t = TaskOf $id
+  head "Window Warmer - $($p.label) [$id]"
+  Write-Host "  enabled    : $(if ($p.enabled) {'yes'} else {'no'})"
+  dim       "  every      : $($p.intervalHours)h $($p.intervalMinutes)m   model=$($p.model)   cmd=$($p.cmd)"
+  if (-not $t) { bad "  task NOT installed   ->  warmer install $id"; return }
   $i = $t | Get-ScheduledTaskInfo
   $state = $t.State
-  if ($state -eq 'Ready') { ok    "  state      : $state" }
-  elseif ($state -eq 'Disabled') { warn "  state      : $state (paused -> warmer enable)" }
+  if ($state -eq 'Ready') { ok "  state      : $state" }
+  elseif ($state -eq 'Disabled') { warn "  state      : $state (paused -> warmer enable $id)" }
   else { warn "  state      : $state" }
   if ($i.LastTaskResult -eq 0x41303 -or $i.LastRunTime.Year -lt 2000) {
     dim "  last run   : not yet (since last re-register)"
@@ -96,25 +144,70 @@ function Cmd-Status {
     if ($i.LastTaskResult -eq 0) { ok $lastLine } else { bad $lastLine }
   }
   Write-Host  "  next ping  : $($i.NextRunTime)  ($(HumanSpan $i.NextRunTime))"
-  dim "  every      : $($c.intervalHours)h $($c.intervalMinutes)m   model=$($c.model)   -> $($c.baseUrl)"
-  $last = @(LogLines) | Select-Object -Last 1
+  $last = LogLines $id | Select-Object -Last 1
   if ($last) { dim "  last log   : $last" }
 }
 
-function Cmd-Ping {
-  $t = TaskOf
-  $before = (@(LogLines)).Count
-  if ($t) { Write-Host "pinging via scheduler..."; Start-ScheduledTask -TaskName $t.TaskName }
-  else    { warn "task not installed - running worker directly"; & $Worker | Out-Null }
-  WaitForPing $before 150
-  $last = @(LogLines) | Select-Object -Last 1
-  if ($last -match 'exit=0') { ok "  $last" } else { bad "  $last" }
+function Cmd-Status($rest) {
+  $id = $rest[0]
+  if ($id) { ValidateProvider $id; Show-Detail $id; return }
+  head "Claude Window Warmer - all providers"
+  $rows = foreach ($pn in ProvIds) {
+    $p = Prov $pn
+    $t = TaskOf $pn
+    $next = if ($t) { ($t | Get-ScheduledTaskInfo).NextRunTime } else { $null }
+    [pscustomobject]@{
+      id       = $pn
+      provider = $p.label
+      on       = if ($p.enabled) {'yes'} else {'-'}
+      task     = if ($t) { $t.State } else { '-' }
+      every    = "$($p.intervalHours)h$($p.intervalMinutes)m"
+      next     = if ($next) { HumanSpan $next } else { '-' }
+    }
+  }
+  ($rows | Format-Table -AutoSize | Out-String).TrimEnd() | Write-Host
+  dim "  detail: warmer status <id>    control: warmer enable|ping|install <id>    warmer list"
 }
 
-function Cmd-Logs($n) {
-  if (-not $n) { $n = 25 }
+function Cmd-List {
+  head "Known providers"
+  $rows = foreach ($pn in ProvIds) {
+    $p = Prov $pn
+    [pscustomobject]@{
+      id        = $pn
+      provider  = $p.label
+      installed = if (Detect $pn) {'yes'} else {'no'}
+      enabled   = if ($p.enabled) {'yes'} else {'no'}
+      every     = "$($p.intervalHours)h$($p.intervalMinutes)m"
+      cmd       = $p.cmd
+    }
+  }
+  ($rows | Format-Table -AutoSize | Out-String).TrimEnd() | Write-Host
+  dim "  enable one:  warmer enable <id>     fix its command:  warmer set <id> cmd <path>"
+}
+
+function Cmd-Ping($rest) {
+  $ids = ResolveIds $rest 'enabled'
+  if ($ids.Count -eq 0) { warn "nothing enabled to ping - try: warmer ping <id>  or  warmer setup"; return }
+  foreach ($id in $ids) {
+    $t = TaskOf $id
+    $before = (LogLines $id).Count
+    if ($t) { Write-Host "pinging $id via scheduler..."; Start-ScheduledTask -TaskName $t.TaskName }
+    else    { warn "[$id] task not installed - running worker directly"; & $Worker -Provider $id | Out-Null }
+    WaitForPing $id $before 150
+    $last = LogLines $id | Select-Object -Last 1
+    if ($last -match 'exit=0') { ok "  $last" } else { bad "  $last" }
+  }
+}
+
+function Cmd-Logs($rest) {
   if (-not (Test-Path $Log)) { warn "no log yet"; return }
-  Get-Content $Log -Tail ([int]$n)
+  $n = 25; $id = $null
+  foreach ($tok in $rest) {
+    if ($tok -match '^\d+$') { $n = [int]$tok }
+    elseif ($tok) { ValidateProvider $tok; $id = $tok }
+  }
+  if ($id) { LogLines $id | Select-Object -Last $n } else { Get-Content $Log -Tail $n }
 }
 
 function Cmd-Follow {
@@ -123,85 +216,156 @@ function Cmd-Follow {
   Get-Content $Log -Tail 10 -Wait
 }
 
-function Cmd-Stats {
-  $lines = @(LogLines)
-  head "Ping stats"
+function Cmd-Stats($rest) {
+  $id = $rest[0]; if ($id) { ValidateProvider $id }
+  $lines = LogLines $id
+  head ("Ping stats" + $(if ($id) { " - $id" } else { "" }))
   if ($lines.Count -eq 0) { warn "  no pings logged yet"; return }
   $okc  = (@($lines | Where-Object { $_ -match 'exit=0' })).Count
   $fail = $lines.Count - $okc
   $rate = [math]::Round(100 * $okc / $lines.Count, 1)
-  $first = ($lines | Select-Object -First 1) -replace '\s\s.*',''
-  $last  = ($lines | Select-Object -Last 1)  -replace '\s\s.*',''
   Write-Host "  total : $($lines.Count)"
   ok        "  ok    : $okc  ($rate%)"
   if ($fail -gt 0) { bad "  fail  : $fail" } else { Write-Host "  fail  : 0" }
-  dim       "  span  : $first  ->  $last"
+  if (-not $id) {
+    dim "  by provider:"
+    foreach ($pn in ProvIds) {
+      $pl = LogLines $pn
+      if ($pl.Count) {
+        $po = (@($pl | Where-Object { $_ -match 'exit=0' })).Count
+        Write-Host ("    {0,-12} {1}/{2} ok" -f $pn, $po, $pl.Count)
+      }
+    }
+  }
   if ($fail -gt 0) {
     $lf = @($lines | Where-Object { $_ -notmatch 'exit=0' }) | Select-Object -Last 1
     bad "  last fail: $lf"
   }
 }
 
-function Cmd-Interval($parts) {
-  if (-not $parts -or $parts.Count -eq 0) { $c = Cfg; Write-Host "current interval: $($c.intervalHours)h $($c.intervalMinutes)m"; return }
-  $iv = ParseInterval $parts
+function Cmd-Config { head "config.json"; Get-Content $CfgPath -Raw }
+
+function Cmd-Interval($rest) {
+  $id = $rest[0]
+  if (-not $id) {
+    head "intervals"
+    foreach ($pn in ProvIds) { $p = Prov $pn; Write-Host ("  {0,-12} {1}h {2}m" -f $pn, $p.intervalHours, $p.intervalMinutes) }
+    return
+  }
+  ValidateProvider $id
+  $spec = @(); if ($rest.Count -gt 1) { $spec = $rest[1..($rest.Count-1)] }
+  if ($spec.Count -eq 0) { $p = Prov $id; Write-Host "current $id interval: $($p.intervalHours)h $($p.intervalMinutes)m"; return }
+  $iv = ParseInterval $spec
   if ($iv.H -eq 0 -and $iv.M -eq 0) { throw "interval can't be zero" }
-  $c = Cfg; $c.intervalHours = $iv.H; $c.intervalMinutes = $iv.M; SaveCfg $c
-  if (TaskOf) { RegisterTask }
-  ok "interval set to $($iv.H)h $($iv.M)m and task re-registered"
+  $c = Cfg; $c.providers.$id.intervalHours = $iv.H; $c.providers.$id.intervalMinutes = $iv.M; SaveCfg $c
+  if (TaskOf $id) { RegisterTask $id; ok "$id interval set to $($iv.H)h $($iv.M)m and task re-registered" }
+  else { ok "$id interval set to $($iv.H)h $($iv.M)m" }
 }
 
-function Cmd-Set($parts) {
-  if ($parts.Count -lt 2) { throw "usage: warmer set <model|prompt|baseUrl> <value...>" }
-  $key = $parts[0]; $val = ($parts[1..($parts.Count-1)] -join ' ')
-  $c = Cfg
-  switch ($key.ToLower()) {
-    'model'   { $c.model = $val }
-    'prompt'  { $c.prompt = $val }
-    'baseurl' { $c.baseUrl = $val }
-    default   { throw "unknown key '$key'. valid: model | prompt | baseUrl" }
+function Cmd-Set($rest) {
+  if ($rest.Count -lt 3) { throw "usage: warmer set <provider> <model|prompt|cmd|baseurl> <value...>" }
+  $id = $rest[0]; ValidateProvider $id
+  $key = ([string]$rest[1]).ToLower(); $val = ($rest[2..($rest.Count-1)] -join ' ')
+  $c = Cfg; $p = $c.providers.$id
+  switch ($key) {
+    'model'   { $p.model = $val }
+    'prompt'  { $p.prompt = $val }
+    'cmd'     { $p.cmd = $val }
+    'baseurl' {
+      if (-not $p.env) { $p | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]@{}) -Force }
+      if ($p.env.PSObject.Properties.Name -contains 'ANTHROPIC_BASE_URL') { $p.env.ANTHROPIC_BASE_URL = $val }
+      else { $p.env | Add-Member -NotePropertyName ANTHROPIC_BASE_URL -NotePropertyValue $val }
+    }
+    default   { throw "unknown key '$key'. valid: model | prompt | cmd | baseurl" }
   }
   SaveCfg $c
-  ok "set $key = $val"
+  ok "set $id $key = $val"
   dim "(takes effect on the next ping - no reinstall needed)"
 }
 
-function Cmd-Config { head "config.json"; Get-Content $CfgPath -Raw }
+function Cmd-Install($rest) {
+  $ids = ResolveIds $rest 'enabled'
+  if ($ids.Count -eq 0) { warn "nothing enabled to install - name one (warmer install claude) or run warmer setup"; return }
+  foreach ($id in $ids) {
+    $c = Cfg; $c.providers.$id.enabled = $true; SaveCfg $c
+    RegisterTask $id
+    $i = TaskOf $id | Get-ScheduledTaskInfo
+    ok "[$id] installed - next ping $($i.NextRunTime)"
+  }
+}
 
-function Cmd-Doctor {
+function Cmd-Uninstall($rest) {
+  $ids = ResolveIds $rest 'all'
+  $any = $false
+  foreach ($id in $ids) {
+    if (TaskOf $id) {
+      Unregister-ScheduledTask -TaskName (TaskName $id) -Confirm:$false
+      $c = Cfg; $c.providers.$id.enabled = $false; SaveCfg $c
+      ok "[$id] task removed"; $any = $true
+    }
+  }
+  Remove-LegacyTask
+  if (-not $any) { warn "no warmer tasks were installed" }
+}
+
+function Cmd-Enable($rest) {
+  $ids = ResolveIds $rest 'require'
+  foreach ($id in $ids) {
+    $c = Cfg; $c.providers.$id.enabled = $true; SaveCfg $c
+    if (TaskOf $id) { Enable-ScheduledTask -TaskName (TaskName $id) | Out-Null } else { RegisterTask $id }
+    ok "[$id] enabled"
+  }
+}
+
+function Cmd-Disable($rest) {
+  $ids = ResolveIds $rest 'require'
+  foreach ($id in $ids) {
+    if (TaskOf $id) { Disable-ScheduledTask -TaskName (TaskName $id) | Out-Null }
+    $c = Cfg; $c.providers.$id.enabled = $false; SaveCfg $c
+    warn "[$id] disabled (warmer enable $id to resume)"
+  }
+}
+
+function Cmd-Restart($rest) {
+  $ids = ResolveIds $rest 'enabled'
+  foreach ($id in $ids) { RegisterTask $id; ok "[$id] re-registered" }
+}
+
+function Cmd-Doctor($rest) {
   head "Warmer doctor"
   $fail = 0
-  # claude cli
-  if (Test-Path $Claude) { ok "  [ok]  claude cli  ($Claude)" } else { bad "  [!!]  claude cli missing at $Claude"; $fail++ }
-  # config
-  try { $c = Cfg; ok "  [ok]  config.json valid (every $($c.intervalHours)h $($c.intervalMinutes)m, model=$($c.model))" }
-  catch { bad "  [!!]  config.json broken: $_"; $fail++ }
-  # oauth creds
+  # shared wiring
   $cred = Join-Path $HOME '.claude\.credentials.json'
   if (Test-Path $cred) {
-    try { $j = Get-Content $cred -Raw | ConvertFrom-Json; if ($j.claudeAiOauth) { ok "  [ok]  subscription oauth present" } else { warn "  [??]  credentials.json has no oauth block" } }
+    try { $j = Get-Content $cred -Raw | ConvertFrom-Json; if ($j.claudeAiOauth) { ok "  [ok]  subscription oauth present (claude/glm)" } else { warn "  [??]  credentials.json has no oauth block" } }
     catch { warn "  [??]  couldn't read credentials.json" }
-  } else { bad "  [!!]  no ~/.claude/.credentials.json - run 'claude' once to log in"; $fail++ }
-  # task
-  $t = TaskOf
-  if ($t) {
-    $i = $t | Get-ScheduledTaskInfo
-    ok "  [ok]  task registered (state=$($t.State), next $($i.NextRunTime))"
-    if (-not $t.Settings.WakeToRun) { warn "  [??]  WakeToRun is off - pings may skip while asleep" }
-  } else { bad "  [!!]  task not registered - run: warmer install"; $fail++ }
-  # global command wiring
+  } else { warn "  [??]  no ~/.claude/.credentials.json (claude/glm need it - run 'claude' once to log in)" }
   $onPath = ([Environment]::GetEnvironmentVariable('Path','User')) -like "*$Root*"
   if ($onPath) { ok "  [ok]  folder on user PATH (warmer.cmd works in cmd)" } else { warn "  [??]  folder not on PATH - run warmer setup" }
   $prof = $PROFILE.CurrentUserAllHosts
   if ((Test-Path $prof) -and ((Get-Content $prof -Raw -ErrorAction SilentlyContinue) -match 'function warmer')) { ok "  [ok]  profile 'warmer' function installed" } else { warn "  [??]  profile function missing - run warmer setup" }
-  # live ping
-  Write-Host "  ...running a live test ping..." -ForegroundColor DarkGray
-  $before = (@(LogLines)).Count
-  if ($t) { Start-ScheduledTask -TaskName $t.TaskName } else { & $Worker | Out-Null }
-  WaitForPing $before 150
-  $last = @(LogLines) | Select-Object -Last 1
-  if ($last -match 'exit=0') { ok "  [ok]  live ping -> $last" } else { bad "  [!!]  live ping failed -> $last"; $fail++ }
+  if (Get-ScheduledTask -TaskName 'ClaudeWindowWarmer' -ErrorAction SilentlyContinue) { warn "  [??]  legacy ClaudeWindowWarmer task still present - run warmer setup" }
 
+  $ids = ResolveIds $rest 'enabled'
+  if ($ids.Count -eq 0) { warn "  nothing enabled - run warmer setup or warmer enable <id>"; return }
+  foreach ($id in $ids) {
+    $p = Prov $id
+    head "  $($p.label) [$id]"
+    if (Detect $id) { ok "    [ok]  cmd found ($($p.cmd))" } else { bad "    [!!]  cmd '$($p.cmd)' not found - warmer set $id cmd <path>"; $fail++ }
+    $t = TaskOf $id
+    if ($t) { $i = $t | Get-ScheduledTaskInfo; ok "    [ok]  task registered (state=$($t.State), next $($i.NextRunTime))" }
+    else    { warn "    [??]  task not registered - warmer install $id" }
+  }
+  # live ping each
+  Write-Host "  ...running live test ping(s)..." -ForegroundColor DarkGray
+  foreach ($id in $ids) {
+    $before = (LogLines $id).Count
+    $t = TaskOf $id
+    if ($t) { Start-ScheduledTask -TaskName $t.TaskName } else { & $Worker -Provider $id | Out-Null }
+    WaitForPing $id $before 150
+    $last = LogLines $id | Select-Object -Last 1
+    if ($last -match 'exit=0') { ok "  [ok]  $id -> $last" } else { bad "  [!!]  $id -> $last"; $fail++ }
+  }
   Write-Host ""
   if ($fail -eq 0) { ok "all good." } else { bad "$fail problem(s) found." }
 }
@@ -211,7 +375,7 @@ function Cmd-Setup {
   # 1. profile function (powershell, all hosts)
   $prof = $PROFILE.CurrentUserAllHosts
   if (-not (Test-Path $prof)) { New-Item -ItemType File -Path $prof -Force | Out-Null }
-  $cur = [string](Get-Content $prof -Raw -ErrorAction SilentlyContinue)   # cast so an empty profile ($null) still adds
+  $cur = [string](Get-Content $prof -Raw -ErrorAction SilentlyContinue)
   if ($cur -notmatch 'function warmer') {
     Add-Content -Path $prof -Value "`nfunction warmer { & `"$Root\warmer.ps1`" @args }"
     ok "  added 'warmer' function to $prof"
@@ -222,51 +386,68 @@ function Cmd-Setup {
     [Environment]::SetEnvironmentVariable('Path', ($up.TrimEnd(';') + ";$Root"), 'User')
     ok "  added $Root to user PATH"
   } else { dim "  folder already on PATH" }
-  # 3. install the task
-  RegisterTask
-  ok "  scheduled task registered"
+  # 3. migrate off the old single-provider task
+  Remove-LegacyTask
+
+  # 4. auto-detect which clis are installed; enable + register those (claude always on)
+  head "Auto-detecting installed CLIs"
+  $c = Cfg
+  foreach ($id in $c.providers.PSObject.Properties.Name) {
+    $found = Detect $id
+    if ($found -or $id -eq 'claude') {
+      $c.providers.$id.enabled = $true
+      ok "  [found] $id  ($($c.providers.$id.label))"
+    } else {
+      dim "  [skip]  $id  (cmd '$($c.providers.$id.cmd)' not on PATH)"
+    }
+  }
+  SaveCfg $c
+  foreach ($id in (ProvIds)) { if ((Prov $id).enabled) { RegisterTask $id } }
+  ok "  scheduled tasks registered for enabled providers"
   Write-Host ""
   warn "open a NEW terminal, then:  warmer status"
 }
 
-function Cmd-Install   { RegisterTask; $i = TaskOf | Get-ScheduledTaskInfo; ok "installed - next ping $($i.NextRunTime)" }
-function Cmd-Uninstall { if (TaskOf) { Unregister-ScheduledTask -TaskName (Cfg).taskName -Confirm:$false; ok "task removed" } else { warn "task wasn't installed" } }
-function Cmd-Enable    { Enable-ScheduledTask  -TaskName (Cfg).taskName | Out-Null; ok "enabled" }
-function Cmd-Disable   { Disable-ScheduledTask -TaskName (Cfg).taskName | Out-Null; warn "paused (warmer enable to resume)" }
-function Cmd-Restart   { RegisterTask; ok "re-registered" }
-function Cmd-Open      { Invoke-Item $Root }
-function Cmd-Version   { Write-Host "warmer $Version" }
+function Cmd-Open    { Invoke-Item $Root }
+function Cmd-Version { Write-Host "warmer $Version" }
 
 function Cmd-Help {
 @"
-warmer - keeps your Claude 5-hour window always freshly cycling
+warmer - keeps each AI-cli's rolling usage window freshly cycling
 
 USAGE
-  warmer [command] [args]
+  warmer [command] [provider] [args]
+
+  most commands take an optional <provider> id (claude, codex, gemini, antigravity,
+  kimi, qwen, glm, copilot, grok). omit it and info commands cover all providers,
+  control commands act on all *enabled* ones. 'all' forces every provider.
 
 INFO
-  status            task state, last/next ping, countdown   (default)
-  stats             success/fail counts and rate from the log
-  logs [N]          show last N log lines (default 25)
-  follow            live-tail the log
-  config            print config.json
-  doctor            full health check + a live test ping
+  status [id]        per-provider table, or detail for one    (default)
+  list               every provider: installed? enabled? interval, cmd
+  stats [id]         success/fail counts from the log
+  logs [N] [id]      last N log lines (optionally one provider)
+  follow             live-tail the log
+  config             print config.json
+  doctor [id]        health check + live test ping(s)
   version
 
 CONTROL
-  ping              fire a ping right now
-  install           register the scheduled task
-  uninstall         remove it
-  enable / disable  resume / pause without uninstalling
-  restart           re-register (after editing config by hand)
-  setup             wire up the global 'warmer' command + install task
-  open              open the warmer folder
+  ping [id|all]      fire a ping now
+  install [id|all]   register scheduled task(s)
+  uninstall [id|all] remove task(s)   (no arg = all)
+  enable <id|all>    resume / register + mark enabled
+  disable <id|all>   pause + mark disabled
+  restart [id|all]   re-register (after a hand edit)
+  setup              wire up the global command + auto-detect & install
+  open               open the warmer folder
 
 TUNING
-  interval <spec>   change cadence, e.g.  warmer interval 5h2m | 5:02 | 302
-  set model <m>     e.g. warmer set model sonnet
-  set prompt <txt>  change the ping text
-  set baseUrl <url> override the api endpoint
+  interval <id> <spec>   change cadence:  warmer interval claude 5h2m | 5:02 | 302
+  set <id> model <m>     warmer set gemini model gemini-2.5-flash
+  set <id> prompt <txt>  change the ping text
+  set <id> cmd <path>    fix the cli command/path
+  set <id> baseurl <url> override the api endpoint (env ANTHROPIC_BASE_URL)
 "@ | Write-Host
 }
 
@@ -276,25 +457,27 @@ $rest = @(); if ($args.Count -gt 1) { $rest = @($args[1..($args.Count-1)]) }
 
 try {
   switch ($cmd) {
-    'status'    { Cmd-Status }
-    'stats'     { Cmd-Stats }
-    'history'   { Cmd-Stats }
-    'logs'      { Cmd-Logs $rest[0] }
-    'log'       { Cmd-Logs $rest[0] }
+    'status'    { Cmd-Status $rest }
+    'list'      { Cmd-List }
+    'ls'        { Cmd-List }
+    'stats'     { Cmd-Stats $rest }
+    'history'   { Cmd-Stats $rest }
+    'logs'      { Cmd-Logs $rest }
+    'log'       { Cmd-Logs $rest }
     'follow'    { Cmd-Follow }
     'tail'      { Cmd-Follow }
     'config'    { Cmd-Config }
-    'doctor'    { Cmd-Doctor }
-    'test'      { Cmd-Doctor }
-    'ping'      { Cmd-Ping }
-    'now'       { Cmd-Ping }
-    'install'   { Cmd-Install }
-    'uninstall' { Cmd-Uninstall }
-    'remove'    { Cmd-Uninstall }
-    'enable'    { Cmd-Enable }
-    'disable'   { Cmd-Disable }
-    'pause'     { Cmd-Disable }
-    'restart'   { Cmd-Restart }
+    'doctor'    { Cmd-Doctor $rest }
+    'test'      { Cmd-Doctor $rest }
+    'ping'      { Cmd-Ping $rest }
+    'now'       { Cmd-Ping $rest }
+    'install'   { Cmd-Install $rest }
+    'uninstall' { Cmd-Uninstall $rest }
+    'remove'    { Cmd-Uninstall $rest }
+    'enable'    { Cmd-Enable $rest }
+    'disable'   { Cmd-Disable $rest }
+    'pause'     { Cmd-Disable $rest }
+    'restart'   { Cmd-Restart $rest }
     'setup'     { Cmd-Setup }
     'open'      { Cmd-Open }
     'interval'  { Cmd-Interval $rest }
