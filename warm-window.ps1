@@ -1,63 +1,114 @@
-# worker the WindowWarmer tasks run each cycle. one tiny ping -> a fresh usage window starts.
-# takes a provider id (claude, codex, gemini, ...). defaults to claude so the old call still works.
-param([string]$Provider = 'claude')
-
+# worker the Warmer task runs each cycle.
 $ErrorActionPreference = 'Continue'
-try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}   # so proxy/chinese errors don't turn into mojibake in the log
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 Set-Location $PSScriptRoot
+
 $log = Join-Path $PSScriptRoot 'warm.log'
-$ts  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+$cfgPath = Join-Path $PSScriptRoot 'config.json'
+$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+$tools = @('claude', 'codex', 'agy')
 
-function logline($code, $msg) {
-  $msg = ($msg -replace '\s+', ' ').Trim()
-  if ($msg.Length -gt 220) { $msg = $msg.Substring(0, 220) }
-  "$ts  [$Provider]  exit=$code  $msg" | Add-Content -Encoding utf8 $log
-}
-
-$cfg = Get-Content (Join-Path $PSScriptRoot 'config.json') -Raw | ConvertFrom-Json
-$p   = $cfg.providers.$Provider
-if (-not $p) { logline 2 "unknown provider '$Provider'"; exit 2 }
-
-# resolve the command. if it looks like a path (has a slash / drive), expand %VARS% and check it exists.
-# otherwise trust it's on PATH and let the call fail loudly if it isn't.
-$cmd = $p.cmd
-if ($cmd -match '[\\/]') {
-  $cmd = [Environment]::ExpandEnvironmentVariables($cmd)
-  if (-not (Test-Path $cmd)) { logline 127 "command not found at $cmd"; exit 127 }
-}
-
-# build args: substitute {prompt} / {model}. if model is blank, drop {model} AND the flag right before it,
-# so a "-m {model}" / "--model {model}" pair vanishes clean instead of passing an empty value.
-$hasModel = -not [string]::IsNullOrWhiteSpace($p.model)
-$argList = @()
-foreach ($a in $p.args) {
-  if ($a -eq '{model}') {
-    if ($hasModel) { $argList += [string]$p.model }
-    else { if ($argList.Count -gt 0) { $argList = $argList[0..($argList.Count-2)] } }  # pop the trailing flag
-    continue
+function HasProp($o, $n) { $null -ne $o.PSObject.Properties[$n] }
+function ToolCommand($tool) {
+  switch ($tool) {
+    'claude' {
+      $p = Join-Path $env:APPDATA 'npm\claude.cmd'
+      if (Test-Path $p) { return $p }
+      $c = Get-Command claude -ErrorAction SilentlyContinue
+    }
+    'codex' {
+      $p = Join-Path $env:APPDATA 'npm\codex.cmd'
+      if (Test-Path $p) { return $p }
+      $c = Get-Command codex -ErrorAction SilentlyContinue
+    }
+    'agy' {
+      $c = Get-Command agy -ErrorAction SilentlyContinue
+    }
   }
-  $argList += ($a -replace '\{prompt\}', $p.prompt) -replace '\{model\}', [string]$p.model
+  if ($c) {
+    if ($c.Source) { return $c.Source }
+    if ($c.Path) { return $c.Path }
+    return $c.Name
+  }
+  $null
 }
 
-# some boxes route a cli through a 3rd-party proxy via the user env (e.g. claude -> cc-switch).
-# provider config can force the right endpoint and ditch inherited keys so the ping hits the real account.
-# (process exits right after, so no need to restore any of this)
-if ($p.env) {
-  foreach ($k in $p.env.PSObject.Properties.Name) { Set-Item -Path "Env:\$k" -Value $p.env.$k }
+function ModelFor($cfg, $tool) {
+  switch ($tool) {
+    'claude' { if (HasProp $cfg 'model') { return [string]$cfg.model } }
+    'codex'  { if (HasProp $cfg 'codexModel') { return [string]$cfg.codexModel } }
+    'agy'    { if (HasProp $cfg 'agyModel') { return [string]$cfg.agyModel } }
+  }
+  ''
 }
-if ($p.clearEnv) {
-  foreach ($k in $p.clearEnv) { Remove-Item "Env:\$k" -ErrorAction SilentlyContinue }
+
+function TextOf($x) {
+  if ($x -is [System.Management.Automation.ErrorRecord]) { return [string]$x.Exception.Message }
+  [string]$x
 }
 
-# $null piped in closes stdin right away so the cli doesn't sit there waiting on it
-$resp = $null | & $cmd @argList 2>&1 | Out-String
-$code = $LASTEXITCODE
-if ($null -eq $code) { $code = 0 }   # some cmds don't set it on a clean run
+function CaptureText($items) {
+  $txt = @($items | ForEach-Object { TextOf $_ }) -join "`n"
+  $txt = $txt -replace "`e\[[0-9;?]*[ -/]*[@-~]", ''
+  $txt = ($txt -replace '\s+', ' ').Trim()
+  if ([string]::IsNullOrWhiteSpace($txt)) { $txt = '(no output)' }
+  if ($txt.Length -gt 220) { $txt = $txt.Substring(0, 220) }
+  $txt
+}
 
-logline $code $resp
+function WriteLog($code, $tool, $text) {
+  "$ts  tool=$tool  exit=$code  $text" | Add-Content -Encoding utf8 $log
+}
 
-# don't let the log grow forever
-$lines = @(Get-Content $log -ErrorAction SilentlyContinue)
-if ($lines.Count -gt 500) { $lines[-500..-1] | Set-Content -Encoding utf8 $log }
+try {
+  $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+  $tool = if ((HasProp $cfg 'tool') -and $cfg.tool) { ([string]$cfg.tool).Trim().ToLower() } else { 'claude' }
+  if ($tools -notcontains $tool) {
+    WriteLog 2 $tool 'unsupported tool. valid: claude | codex | agy'
+    exit 2
+  }
 
-exit $code
+  $cmd = ToolCommand $tool
+  if (-not $cmd) {
+    WriteLog 127 $tool "$tool command not found"
+    exit 127
+  }
+
+  $prompt = if (HasProp $cfg 'prompt') { [string]$cfg.prompt } else { 'Reply with only: ok' }
+  $model = ModelFor $cfg $tool
+
+  if ($tool -eq 'claude') {
+    if (HasProp $cfg 'baseUrl') { $env:ANTHROPIC_BASE_URL = $cfg.baseUrl }
+    Remove-Item Env:\ANTHROPIC_API_KEY    -ErrorAction SilentlyContinue
+    Remove-Item Env:\ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
+
+    $a = @('-p', $prompt, '--output-format', 'text', '--strict-mcp-config')
+    if (-not [string]::IsNullOrWhiteSpace($model)) { $a += @('--model', $model) }
+    $out = $null | & $cmd @a 2>&1
+    $code = $LASTEXITCODE
+  }
+  elseif ($tool -eq 'codex') {
+    $a = @('exec', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '-C', $PSScriptRoot, '--color', 'never')
+    if (-not [string]::IsNullOrWhiteSpace($model)) { $a += @('-m', $model) }
+    $a += @($prompt)
+    $out = & $cmd @a 2>&1
+    $code = $LASTEXITCODE
+  }
+  elseif ($tool -eq 'agy') {
+    $a = @('--print', '--print-timeout', '2m')
+    if (-not [string]::IsNullOrWhiteSpace($model)) { $a += @('--model', $model) }
+    $a += @($prompt)
+    $out = & $cmd @a 2>&1
+    $code = $LASTEXITCODE
+  }
+
+  WriteLog $code $tool (CaptureText $out)
+
+  $lines = @(Get-Content $log -ErrorAction SilentlyContinue)
+  if ($lines.Count -gt 500) { $lines[-500..-1] | Set-Content -Encoding utf8 $log }
+  exit $code
+} catch {
+  WriteLog 1 'unknown' (CaptureText @($_))
+  exit 1
+}
+
