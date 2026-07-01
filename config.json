@@ -1,88 +1,11 @@
-{
-    "taskPrefix": "WindowWarmer",
-    "providers": {
-        "claude": {
-            "label": "Claude Code",
-            "cmd": "%APPDATA%\\npm\\claude.cmd",
-            "args": ["-p", "{prompt}", "--model", "{model}", "--output-format", "text", "--strict-mcp-config"],
-            "model": "haiku",
-            "prompt": "Reply with only: ok",
-            "intervalHours": 5,
-            "intervalMinutes": 2,
-            "env": { "ANTHROPIC_BASE_URL": "https://api.anthropic.com" },
-            "clearEnv": ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
-            "enabled": true
-        },
-        "codex": {
-            "label": "Codex (OpenAI)",
-            "cmd": "codex",
-            "args": ["exec", "--sandbox", "read-only", "{prompt}"],
-            "model": "",
-            "prompt": "ping",
-            "intervalHours": 5,
-            "intervalMinutes": 2,
-            "enabled": false
-        },
-        "antigravity": {
-            "label": "Google Antigravity",
-            "cmd": "agy",
-            "args": ["-p", "{prompt}", "--model", "{model}"],
-            "model": "",
-            "prompt": "ping",
-            "intervalHours": 5,
-            "intervalMinutes": 2,
-            "enabled": false
-        },
-        "kimi": {
-            "label": "Kimi (Moonshot)",
-            "cmd": "kimi",
-            "args": ["-p", "{prompt}"],
-            "model": "",
-            "prompt": "ping",
-            "intervalHours": 5,
-            "intervalMinutes": 2,
-            "enabled": false
-        },
-        "qwen": {
-            "label": "Qwen Code",
-            "cmd": "qwen",
-            "args": ["-p", "{prompt}"],
-            "model": "",
-            "prompt": "ping",
-            "intervalHours": 5,
-            "intervalMinutes": 2,
-            "enabled": false
-        },
-        "glm": {
-            "label": "GLM (z.ai)",
-            "cmd": "%APPDATA%\\npm\\claude.cmd",
-            "args": ["-p", "{prompt}", "--model", "{model}", "--output-format", "text", "--strict-mcp-config"],
-            "model": "glm-4.6",
-            "prompt": "ping",
-            "intervalHours": 5,
-            "intervalMinutes": 2,
-            "env": { "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic" },
-            "enabled": false
-        },
-        "copilot": {
-            "label": "GitHub Copilot CLI",
-            "cmd": "copilot",
-            "args": ["-p", "{prompt}", "--allow-all-tools"],
-            "model": "",
-            "prompt": "ping",
-            "intervalHours": 144,
-            "intervalMinutes": 0,
-            "enabled": false
-        },
-        "grok": {
-            "label": "Grok (xAI)",
-            "cmd": "grok",
-            "args": ["-p", "{prompt}"],
-            "model": "",
-            "prompt": "ping",
-            "intervalHours": 24,
-            "intervalMinutes": 0,
-            "enabled": false
-        }
-    }
+﻿{
+    "taskName":  "Warmer",
+    "tool":  "codex",
+    "model":  "haiku",
+    "codexModel":  "",
+    "agyModel":  "",
+    "prompt":  "Reply with only: ok",
+    "baseUrl":  "https://api.anthropic.com",
+    "intervalHours":  5,
+    "intervalMinutes":  1
 }
