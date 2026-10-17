@@ -1,11 +1,8 @@
-﻿{
-    "taskName":  "Warmer",
-    "tool":  "codex",
-    "model":  "haiku",
-    "codexModel":  "",
-    "agyModel":  "",
-    "prompt":  "Reply with only: ok",
-    "baseUrl":  "https://api.anthropic.com",
-    "intervalHours":  5,
-    "intervalMinutes":  1
+{
+  "taskName": "Warmer",
+  "model": "haiku",
+  "prompt": "Reply with only: ok",
+  "baseUrl": "https://api.anthropic.com",
+  "intervalHours": 5,
+  "intervalMinutes": 1
 }

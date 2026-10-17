@@ -1,4 +1,4 @@
-# warmer - keeps one selected cli warm.
+# warmer - keeps the claude 5h usage window cycling with a tiny scheduled ping.
 # no param() block on purpose so subcommand args pass through as $args.
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
@@ -7,8 +7,7 @@ $Root    = $PSScriptRoot
 $CfgPath = Join-Path $Root 'config.json'
 $Log     = Join-Path $Root 'warm.log'
 $Worker  = Join-Path $Root 'warm-window.ps1'
-$Version = '1.1.0'
-$Tools   = @('claude', 'codex', 'agy')
+$Version = '2.0.0'
 
 function ok($m)   { Write-Host $m -ForegroundColor Green }
 function bad($m)  { Write-Host $m -ForegroundColor Red }
@@ -23,64 +22,41 @@ function PutProp($o, $n, $v) {
 }
 
 function Cfg {
-  $c = Get-Content $CfgPath -Raw | ConvertFrom-Json
+  $c = Get-Content $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
   if (-not (HasProp $c 'taskName')) { AddProp $c 'taskName' 'Warmer' }
-  if (-not (HasProp $c 'tool')) { AddProp $c 'tool' 'claude' }
   if (-not (HasProp $c 'model')) { AddProp $c 'model' 'haiku' }
-  if (-not (HasProp $c 'codexModel')) { AddProp $c 'codexModel' '' }
-  if (-not (HasProp $c 'agyModel')) { AddProp $c 'agyModel' '' }
+  if (-not (HasProp $c 'baseUrl')) { AddProp $c 'baseUrl' 'https://api.anthropic.com' }
   $c
 }
-function SaveCfg($c) { ($c | ConvertTo-Json -Depth 6) | Set-Content -Encoding utf8 $CfgPath }
-
-function CleanTool($tool) {
-  $t = ([string]$tool).Trim().ToLower()
-  if ($Tools -notcontains $t) { throw "unknown tool '$tool'. valid: claude | codex | agy" }
-  $t
-}
-function CurrentTool($c) { CleanTool $c.tool }
-
-function ModelFor($c, $tool) {
-  switch ($tool) {
-    'claude' { return [string]$c.model }
-    'codex'  { return [string]$c.codexModel }
-    'agy'    { return [string]$c.agyModel }
-  }
-}
-function SetModelFor($c, $tool, $model) {
-  switch ($tool) {
-    'claude' { PutProp $c 'model' $model }
-    'codex'  { PutProp $c 'codexModel' $model }
-    'agy'    { PutProp $c 'agyModel' $model }
-  }
-}
-function DisplayModel($c, $tool) {
-  $m = ModelFor $c $tool
-  if ([string]::IsNullOrWhiteSpace($m)) { 'default' } else { $m }
+# no BOM, so the bash version's jq can read it too. drop old multi-tool keys while we're at it
+function SaveCfg($c) {
+  foreach ($k in @('tool', 'codexModel', 'agyModel')) { $c.PSObject.Properties.Remove($k) }
+  [IO.File]::WriteAllText($CfgPath, ($c | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding $false))
 }
 
-function ToolCommand($tool) {
-  switch ($tool) {
-    'claude' {
-      $p = Join-Path $env:APPDATA 'npm\claude.cmd'
-      if (Test-Path $p) { return $p }
-      $c = Get-Command claude -ErrorAction SilentlyContinue
-    }
-    'codex' {
-      $p = Join-Path $env:APPDATA 'npm\codex.cmd'
-      if (Test-Path $p) { return $p }
-      $c = Get-Command codex -ErrorAction SilentlyContinue
-    }
-    'agy' {
-      $c = Get-Command agy -ErrorAction SilentlyContinue
-    }
-  }
+function DisplayModel($c) {
+  if ([string]::IsNullOrWhiteSpace([string]$c.model)) { 'default' } else { [string]$c.model }
+}
+
+function ClaudeCommand {
+  $p = Join-Path $env:APPDATA 'npm\claude.cmd'
+  if (Test-Path $p) { return $p }
+  $c = Get-Command claude -ErrorAction SilentlyContinue
   if ($c) {
     if ($c.Source) { return $c.Source }
     if ($c.Path) { return $c.Path }
     return $c.Name
   }
   $null
+}
+
+# child process so the worker's env changes and Set-Location stay out of your shell
+function RunWorker { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Worker | Out-Null }
+
+# start via the scheduler unless it's missing or paused (a disabled task refuses to start)
+function StartPing($t) {
+  if ($t -and $t.State -ne 'Disabled') { Start-ScheduledTask -TaskName $t.TaskName; return }
+  RunWorker
 }
 
 function TaskOf { Get-ScheduledTask -TaskName (Cfg).taskName -ErrorAction SilentlyContinue }
@@ -104,7 +80,7 @@ function ParseInterval($parts) {
   if ($txt -match '^(\d+)\s*:\s*(\d+)$')             { return @{ H=[int]$Matches[1]; M=[int]$Matches[2] } }
   if ($txt -match '^(\d+)\s+(\d+)$')                 { return @{ H=[int]$Matches[1]; M=[int]$Matches[2] } }
   if ($txt -match '^(\d+)\s*[mM]?$')                 { $t=[int]$Matches[1]; return @{ H=[math]::Floor($t/60); M=$t%60 } }
-  throw "can't parse interval '$txt'. try: 5h2m | 5:02 | 302"
+  throw "can't parse interval '$txt'. try: 5h1m | 5:01 | 301"
 }
 
 function RegisterTask {
@@ -123,30 +99,35 @@ function RegisterTask {
   Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
   Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
 
-  powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP RTCWAKE 1 2>$null | Out-Null
-  powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP RTCWAKE 1 2>$null | Out-Null
-  powercfg /SETACTIVE SCHEME_CURRENT 2>$null | Out-Null
+  # allow wake timers. best effort, a locked power plan shouldn't fail setup
+  try {
+    powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP RTCWAKE 1 2>$null | Out-Null
+    powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP RTCWAKE 1 2>$null | Out-Null
+    powercfg /SETACTIVE SCHEME_CURRENT 2>$null | Out-Null
+  } catch {}
 }
 
 function LogLines { @(Get-Content $Log -ErrorAction SilentlyContinue) | Where-Object { $_ -match 'exit=' } }
 
-function WaitForPing($beforeCount, $timeoutSec) {
+# true if a new log line showed up. compares the last line too since the log is trimmed at 500
+function WaitForPing($beforeLast, $timeoutSec) {
   $deadline = (Get-Date).AddSeconds($timeoutSec)
   do {
     Start-Sleep -Seconds 4
-    $now = (@(LogLines)).Count
+    $now = @(LogLines) | Select-Object -Last 1
     $t = TaskOf
     $running = $t -and ((Get-ScheduledTask -TaskName $t.TaskName | Get-ScheduledTaskInfo).LastTaskResult -eq 0x41301)
-  } until (($now -gt $beforeCount -and -not $running) -or (Get-Date) -gt $deadline)
+    if ($now -and $now -ne $beforeLast -and -not $running) { return $true }
+  } until ((Get-Date) -gt $deadline)
+  $false
 }
 
 function Cmd-Status {
   $c = Cfg
-  $tool = CurrentTool $c
   $t = TaskOf
   head "Warmer"
-  dim "  tool       : $tool   model=$(DisplayModel $c $tool)"
-  if ($tool -eq 'claude') { dim "  endpoint   : $($c.baseUrl)" }
+  dim "  model      : $(DisplayModel $c)"
+  dim "  endpoint   : $($c.baseUrl)"
   if (-not $t) { bad "  task       : not installed -> run: warmer install"; return }
   $i = $t | Get-ScheduledTaskInfo
   $state = $t.State
@@ -168,12 +149,13 @@ function Cmd-Status {
 
 function Cmd-Ping {
   $t = TaskOf
-  $before = (@(LogLines)).Count
-  if ($t) { Write-Host "pinging via scheduler..."; Start-ScheduledTask -TaskName $t.TaskName }
-  else    { warn "task not installed - running worker directly"; & $Worker | Out-Null }
-  WaitForPing $before 300
+  $before = @(LogLines) | Select-Object -Last 1
+  if ($t -and $t.State -ne 'Disabled') { Write-Host "pinging via scheduler..." }
+  else { warn "task not installed or paused - running worker directly" }
+  StartPing $t
+  if (-not (WaitForPing $before 300)) { bad "  no new log line after 5 min"; return }
   $last = @(LogLines) | Select-Object -Last 1
-  if ($last -match 'exit=0') { ok "  $last" } else { bad "  $last" }
+  if ($last -match '  exit=0  ') { ok "  $last" } else { bad "  $last" }
 }
 
 function Cmd-Logs($n) {
@@ -192,7 +174,7 @@ function Cmd-Stats {
   $lines = @(LogLines)
   head "Ping stats"
   if ($lines.Count -eq 0) { warn "  no pings logged yet"; return }
-  $okc  = (@($lines | Where-Object { $_ -match 'exit=0' })).Count
+  $okc  = (@($lines | Where-Object { $_ -match '  exit=0  ' })).Count
   $fail = $lines.Count - $okc
   $rate = [math]::Round(100 * $okc / $lines.Count, 1)
   $first = ($lines | Select-Object -First 1) -replace '\s\s.*',''
@@ -202,7 +184,7 @@ function Cmd-Stats {
   if ($fail -gt 0) { bad "  fail  : $fail" } else { Write-Host "  fail  : 0" }
   dim       "  span  : $first  ->  $last"
   if ($fail -gt 0) {
-    $lf = @($lines | Where-Object { $_ -notmatch 'exit=0' }) | Select-Object -Last 1
+    $lf = @($lines | Where-Object { $_ -notmatch '  exit=0  ' }) | Select-Object -Last 1
     bad "  last fail: $lf"
   }
 }
@@ -211,32 +193,21 @@ function Cmd-Interval($parts) {
   if (-not $parts -or $parts.Count -eq 0) { $c = Cfg; Write-Host "current interval: $($c.intervalHours)h $($c.intervalMinutes)m"; return }
   $iv = ParseInterval $parts
   if ($iv.H -eq 0 -and $iv.M -eq 0) { throw "interval can't be zero" }
+  $iv.H = [int]($iv.H + [math]::Floor($iv.M / 60)); $iv.M = $iv.M % 60
   $c = Cfg; $c.intervalHours = $iv.H; $c.intervalMinutes = $iv.M; SaveCfg $c
   if (TaskOf) { RegisterTask }
   ok "interval set to $($iv.H)h $($iv.M)m and task re-registered"
 }
 
-function Cmd-Use($parts) {
-  if (-not $parts -or $parts.Count -lt 1) { throw "usage: warmer use <claude|codex|agy>" }
-  $tool = CleanTool $parts[0]
-  if (-not (ToolCommand $tool)) { throw "$tool is not installed or not on PATH" }
-  $c = Cfg
-  PutProp $c 'tool' $tool
-  SaveCfg $c
-  ok "using $tool"
-  dim "run warmer ping to test it now"
-}
-
 function Cmd-Set($parts) {
-  if ($parts.Count -lt 2) { throw "usage: warmer set <tool|model|prompt|baseUrl> <value...>" }
+  if ($parts.Count -lt 2) { throw "usage: warmer set <model|prompt|baseUrl> <value...>" }
   $key = $parts[0].ToLower(); $val = ($parts[1..($parts.Count-1)] -join ' ')
   $c = Cfg
   switch ($key) {
-    'tool'    { PutProp $c 'tool' (CleanTool $val) }
-    'model'   { SetModelFor $c (CurrentTool $c) $val }
+    'model'   { PutProp $c 'model' $val }
     'prompt'  { PutProp $c 'prompt' $val }
     'baseurl' { PutProp $c 'baseUrl' $val }
-    default   { throw "unknown key '$key'. valid: tool | model | prompt | baseUrl" }
+    default   { throw "unknown key '$key'. valid: model | prompt | baseUrl" }
   }
   SaveCfg $c
   ok "set $key = $val"
@@ -245,40 +216,24 @@ function Cmd-Set($parts) {
 
 function Cmd-Config { head "config.json"; Get-Content $CfgPath -Raw }
 
-function Cmd-Tools {
-  $c = Cfg
-  $cur = CurrentTool $c
-  head "Tools"
-  foreach ($t in $Tools) {
-    $cmd = ToolCommand $t
-    $mark = if ($t -eq $cur) { '*' } else { ' ' }
-    if ($cmd) { ok "  $mark $t  ok  $cmd" } else { bad "  $mark $t  missing" }
-  }
-}
-
 function Cmd-Doctor {
   head "Warmer doctor"
   $fail = 0
   try {
     $c = Cfg
-    $tool = CurrentTool $c
-    ok "  [ok]  config.json valid (tool=$tool, every $($c.intervalHours)h $($c.intervalMinutes)m)"
+    ok "  [ok]  config.json valid (model=$(DisplayModel $c), every $($c.intervalHours)h $($c.intervalMinutes)m)"
   } catch {
-    bad "  [!!]  config.json broken: $_"; $fail++; $tool = 'claude'
+    bad "  [!!]  config.json broken: $_"; $fail++
   }
 
-  foreach ($t in $Tools) {
-    $cmd = ToolCommand $t
-    if ($cmd) { ok "  [ok]  $t cli ($cmd)" } else { bad "  [!!]  $t cli missing"; if ($t -eq $tool) { $fail++ } }
-  }
+  $cmd = ClaudeCommand
+  if ($cmd) { ok "  [ok]  claude cli ($cmd)" } else { bad "  [!!]  claude cli missing"; $fail++ }
 
-  if ($tool -eq 'claude') {
-    $cred = Join-Path $HOME '.claude\.credentials.json'
-    if (Test-Path $cred) {
-      try { $j = Get-Content $cred -Raw | ConvertFrom-Json; if ($j.claudeAiOauth) { ok "  [ok]  claude oauth present" } else { warn "  [??]  credentials.json has no oauth block" } }
-      catch { warn "  [??]  couldn't read credentials.json" }
-    } else { bad "  [!!]  no ~/.claude/.credentials.json - run 'claude' once"; $fail++ }
-  }
+  $cred = Join-Path $HOME '.claude\.credentials.json'
+  if (Test-Path $cred) {
+    try { $j = Get-Content $cred -Raw | ConvertFrom-Json; if ($j.claudeAiOauth) { ok "  [ok]  claude oauth present" } else { warn "  [??]  credentials.json has no oauth block" } }
+    catch { warn "  [??]  couldn't read credentials.json" }
+  } else { bad "  [!!]  no ~/.claude/.credentials.json - run 'claude' once"; $fail++ }
 
   $t = TaskOf
   if ($t) {
@@ -294,11 +249,11 @@ function Cmd-Doctor {
   if ((Test-Path $prof) -and ((Get-Content $prof -Raw -ErrorAction SilentlyContinue) -match $needle)) { ok "  [ok]  profile warmer function points here" } else { warn "  [??]  profile function missing/stale - run warmer setup" }
 
   Write-Host "  ...running a live test ping..." -ForegroundColor DarkGray
-  $before = (@(LogLines)).Count
-  if ($t) { Start-ScheduledTask -TaskName $t.TaskName } else { & $Worker | Out-Null }
-  WaitForPing $before 300
+  $before = @(LogLines) | Select-Object -Last 1
+  StartPing $t
+  $got = WaitForPing $before 300
   $last = @(LogLines) | Select-Object -Last 1
-  if ($last -match 'exit=0') { ok "  [ok]  live ping -> $last" } else { bad "  [!!]  live ping failed -> $last"; $fail++ }
+  if ($got -and $last -match '  exit=0  ') { ok "  [ok]  live ping -> $last" } else { bad "  [!!]  live ping failed -> $last"; $fail++ }
 
   Write-Host ""
   if ($fail -eq 0) { ok "all good." } else { bad "$fail problem(s) found." }
@@ -358,14 +313,13 @@ function Cmd-Version   { Write-Host "warmer $Version" }
 
 function Cmd-Help {
 @"
-warmer - keeps claude, codex, or agy warmed with a tiny scheduled ping
+warmer - keeps the claude 5h usage window cycling with a tiny scheduled ping
 
 usage
   warmer [command] [args]
 
 info
-  status            task state, selected tool, last/next ping
-  tools             show claude/codex/agy install status
+  status            task state, last/next ping
   stats             success/fail counts and rate from the log
   logs [N]          show last N log lines (default 25)
   follow            live-tail the log
@@ -374,8 +328,7 @@ info
   version
 
 control
-  use <tool>        switch tool: claude | codex | agy
-  ping              fire a ping right now
+  ping              ping claude right now
   install           register the scheduled task
   uninstall         remove the scheduled task
   enable / disable  resume / pause without uninstalling
@@ -384,10 +337,10 @@ control
   open              open the warmer folder
 
 tuning
-  interval <spec>   change cadence, e.g. warmer interval 5h2m | 5:02 | 302
-  set model <m>     set model for the selected tool
+  interval <spec>   change cadence, e.g. warmer interval 5h1m | 5:01 | 301
+  set model <m>     e.g. warmer set model haiku
   set prompt <txt>  change the ping text
-  set baseUrl <url> override claude's api endpoint
+  set baseUrl <url> override the api endpoint
 "@ | Write-Host
 }
 
@@ -397,7 +350,6 @@ $rest = @(); if ($args.Count -gt 1) { $rest = @($args[1..($args.Count-1)]) }
 try {
   switch ($cmd) {
     'status'    { Cmd-Status }
-    'tools'     { Cmd-Tools }
     'stats'     { Cmd-Stats }
     'history'   { Cmd-Stats }
     'logs'      { Cmd-Logs $rest[0] }
@@ -409,8 +361,6 @@ try {
     'test'      { Cmd-Doctor }
     'ping'      { Cmd-Ping }
     'now'       { Cmd-Ping }
-    'use'       { Cmd-Use $rest }
-    'switch'    { Cmd-Use $rest }
     'install'   { Cmd-Install }
     'uninstall' { Cmd-Uninstall }
     'remove'    { Cmd-Uninstall }
