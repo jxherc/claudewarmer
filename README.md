@@ -1,5 +1,7 @@
 # warmer
 
+[简体中文](README.zh-Hans.md)
+
 keeps your claude 5-hour usage window cycling. every 5h 1m it sends one tiny `claude -p` ping, which starts a fresh window on your subscription. the extra minute makes sure the old window has closed first, so the windows line up back to back.
 
 the ping is a haiku call with no mcp servers, no hooks and no saved session, so it costs almost nothing.
