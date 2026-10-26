@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # warmer - keeps the claude 5h usage window cycling with a tiny scheduled ping.
 # macos uses a launchd agent (cron can't read the keychain login), linux uses cron.
-# both just run the worker every 5 min with --due, the worker decides if the interval is up.
+# both just run the worker every minute with --due, the worker decides if it's time
+# (1 min after the real 5h window resets, or the interval when that can't be read).
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,16 +33,8 @@ set_json() {
 ival_h() { cfgv '.intervalHours // 5'; }
 ival_m() { cfgv '.intervalMinutes // 1'; }
 model()  { local m; m="$(cfgv '.model // "haiku"')"; [ -n "$m" ] && echo "$m" || echo default; }
-# interval in seconds, same fallback as the worker
-ival_s() {
-  local h m; h="$(ival_h)"; m="$(ival_m)"
-  case "$h" in ''|*[!0-9]*) h=5; m=1 ;; esac
-  case "$m" in ''|*[!0-9]*) h=5; m=1 ;; esac
-  local s=$(( 10#$h * 3600 + 10#$m * 60 )); [ "$s" -ge 300 ] || s=18060
-  echo "$s"
-}
 
-fmt_ts() { date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M'; }
+fmt_ts() { date -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M:%S'; }
 span() {
   local s="$1" out="" sfx=""
   if [ "$s" -lt 0 ]; then s=$(( -s )); sfx=" ago"; else out="in "; fi
@@ -113,7 +106,7 @@ register() {
   <dict>
     <key>PATH</key><string>$(xml "$PATH")</string>
   </dict>
-  <key>StartInterval</key><integer>300</integer>
+  <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>/dev/null</string>
   <key>StandardErrorPath</key><string>$(xml "$here/launchd.log")</string>
@@ -126,7 +119,7 @@ EOF
     # cron treats % as newline, escape it
     local pe="${PATH//%/\\%}"
     { cron_pick 0
-      printf '*/5 * * * * PATH="%s" /bin/bash "%s" --due >/dev/null 2>&1 %s\n' "$pe" "$worker" "$(marker)"
+      printf '* * * * * PATH="%s" /bin/bash "%s" --due >/dev/null 2>&1 %s\n' "$pe" "$worker" "$(marker)"
     } | crontab -
   fi
 }
@@ -165,27 +158,27 @@ cmd_status() {
   title "warmer"
   dim "  model    : $(model)"
   dim "  endpoint : $(cfgv '.baseUrl // "https://api.anthropic.com"')"
-  dim "  every    : $(ival_h)h $(ival_m)m"
+  dim "  fallback : every $(ival_h)h $(ival_m)m when the 5h reset can't be read"
   case "$(sched_state)" in
-    on)     ok   "  schedule : on ($(backend), checks every 5m)" ;;
+    on)     ok   "  schedule : on ($(backend), checks every minute)" ;;
     paused) warn "  schedule : paused -> warmer enable" ;;
     off)    bad  "  schedule : not installed -> warmer install" ;;
   esac
-  local last="" code="" now next
-  [ -f "$state" ] && read -r last code < "$state"
-  case "$last" in ''|*[!0-9]*) last="" ;; esac
-  if [ -n "$last" ]; then
-    now="$(date +%s)"
-    next=$(( last + $(ival_s) ))
-    # same retry rule as the worker
-    [ "$code" = 0 ] || [ $(( next - last )) -le 900 ] || next=$(( last + 900 ))
+  # from the state file, not the api: the usage api is rate limited
+  local now next="" r=""; now="$(date +%s)"
+  [ -f "$state" ] && read -r _ _ next r < "$state"
+  case "$next" in *[!0-9]*) next="" ;; esac
+  case "$r" in ''|*[!0-9]*) r=0 ;; esac
+  if [ "$r" -gt "$now" ]; then echo "  window   : resets $(fmt_ts "$r") ($(span $(( r - now ))))"
+  else echo "  window   : not known yet (warmer doctor reads it live)"; fi
+  if [ -n "$next" ]; then
     [ "$next" -lt "$now" ] && next="$now"
     echo "  next     : $(fmt_ts "$next") ($(span $(( next - now ))))"
   else
-    echo "  next     : on the next check (no ping yet)"
+    echo "  next     : on the next check"
   fi
   local ll; ll="$(log_lines | tail -n 1)"
-  [ -n "$ll" ] && dim "  last log : $ll"
+  [ -n "$ll" ] && dim "  last ping: $ll"
   return 0
 }
 
@@ -249,10 +242,10 @@ cmd_interval() {
   h=$(( 10#${hm% *} )); m=$(( 10#${hm#* } ))
   # carry minutes over 59 into hours
   h=$(( h + m / 60 )); m=$(( m % 60 ))
-  [ $(( h * 60 + m )) -ge 5 ] || die "interval must be at least 5m (the scheduler checks every 5m)"
+  [ $(( h * 60 + m )) -ge 5 ] || die "interval must be at least 5m"
   set_json --argjson h "$h" --argjson m "$m" '.intervalHours=$h | .intervalMinutes=$m'
   ok "interval set to ${h}h ${m}m"
-  dim "(takes effect on the next check, no reinstall needed)"
+  dim "(only used when the 5h reset can't be read. takes effect on the next check)"
 }
 
 cmd_set() {
@@ -269,7 +262,7 @@ cmd_set() {
   dim "(takes effect on the next ping)"
 }
 
-cmd_install()   { register; ok "installed ($(backend)) - pings now if due, then every $(ival_h)h $(ival_m)m"; }
+cmd_install()   { register; ok "installed ($(backend)) - checks every minute, pings 1 min after each 5h reset"; }
 cmd_uninstall() {
   [ "$(sched_state)" = off ] && { warn "wasn't installed"; return 0; }
   unregister; ok "removed the $(backend) schedule"
@@ -316,6 +309,12 @@ cmd_doctor() {
   dim "  ...running a live test ping..."
   if cmd_ping >/dev/null 2>&1; then ok "  [ok]  live ping -> $(log_lines | tail -n 1)"
   else bad "  [!!]  live ping failed -> $(log_lines | tail -n 1)"; fail=$((fail+1)); fi
+  local r; r="$(bash "$worker" --reset)"
+  case "$r" in
+    none)        warn "  [??]  usage api reads fine but shows no 5h window yet" ;;
+    ''|*[!0-9]*) warn "  [??]  can't read the 5h reset, pings fall back to every $(ival_h)h $(ival_m)m" ;;
+    *)           ok   "  [ok]  5h window resets $(fmt_ts "$r"), next ping 1 min after" ;;
+  esac
   echo
   if [ "$fail" = 0 ]; then ok "all good."; else bad "$fail problem(s) found."; return 1; fi
 }
@@ -375,7 +374,7 @@ control
   open              open the warmer folder
 
 tuning
-  interval <spec>   e.g. warmer interval 5h1m | 5:01 | 301
+  interval <spec>   fallback when the 5h reset can't be read, e.g. 5h1m | 5:01 | 301
   set model <m>     e.g. warmer set model haiku
   set prompt <txt>  change the ping text
   set baseUrl <url> override the api endpoint
